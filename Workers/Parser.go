@@ -24,10 +24,7 @@ func (p Parser) Run() {
 		Job.ParseItem.Parse()
 		p.Out <- Job
 	}
-	p.Wg.Done()
-}
-
-func (p Parser) Shutdown() {
+	fmt.Println("Shutdown Parser", p.Id)
 	p.Wg.Done()
 }
 

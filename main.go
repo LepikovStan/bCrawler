@@ -6,24 +6,26 @@ import (
 
 	"sync"
 
+	"os"
+	"os/signal"
+
 	"github.com/LepikovStan/bCrawler/Crawl"
 	"github.com/LepikovStan/bCrawler/Parse"
-	"github.com/LepikovStan/bCrawler/Queue"
 	"github.com/LepikovStan/bCrawler/Workers"
 )
 
 const (
-	CrawlersCount = 10
+	CrawlersCount = 5
 	ParsersCount  = 5
-	MaxDepth      = 2
+	MaxDepth      = 3
+	RetryTime     = time.Second * 3
 )
 
 var (
-	JobId     = 0
-	JobsCount = 0
-	Count     = 0
-	cPool     = make([]*Workers.Crawler, CrawlersCount)
-	pPool     = make([]*Workers.Parser, ParsersCount)
+	JobId = 0
+	Count = 0
+	cPool = make([]*Workers.Crawler, CrawlersCount)
+	pPool = make([]*Workers.Parser, ParsersCount)
 )
 
 func NewJobId() int {
@@ -48,24 +50,85 @@ func RunParsers(ParseIn, ParseOut chan *Workers.ParseJob, wg *sync.WaitGroup) {
 	}
 }
 
+func ErrorsDispatcher(Out chan *Workers.CrawlJob, JobsList *JobsPool) {
+	for {
+		time.Sleep(RetryTime)
+		Job := JobsList.ErrorQueue.Pop().(*Workers.CrawlJob)
+		if Job == nil {
+			continue
+		}
+		Job.Retry--
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if fmt.Sprintf("%s", r) != "send on closed channel" {
+						panic(r)
+					}
+				}
+			}()
+			Out <- Job
+		}()
+	}
+}
+
 func Dispatcher(CrawlIn, CrawlOut chan *Workers.CrawlJob, ParseIn, ParseOut chan *Workers.ParseJob, JobsList *JobsPool) {
 	for {
 		select {
 		case Job := <-CrawlOut:
-			fmt.Println("Crawled", Job.Id, len(Job.CrawlItem.Body), JobsList.Queue.Len(), JobsList.Count())
-			if Job.CrawlItem.Error == nil {
-				go func() {
-					ParseIn <- Workers.NewParseJob(Job.Id, Job.Depth, Parse.NewItem(Job.CrawlItem.Body))
-				}()
+			if Job == nil {
+				continue
 			}
-		case Job := <-ParseOut:
-			JobsList.DecCount()
-			Count++
-			fmt.Println("Parsed", Job.Id, len(Job.ParseItem.BLList), JobsList.Queue.Len(), JobsList.Count())
+			if Job.CrawlItem.Error != nil {
+				fmt.Println("Crawled with error", Job.Id, Job.CrawlItem.Url, len(Job.CrawlItem.Body), Job.CrawlItem.Error)
+				JobsList.DoneJob()
 
-			if JobsList.Queue.Len() == 0 && Job.Depth+1 > MaxDepth && JobsList.Count() == 0 {
-				ShutdownWorkers(CrawlIn, CrawlOut, ParseIn, ParseOut)
+				if Job.Retry == Workers.Retry {
+					JobsList.IncErrCount(Workers.Retry)
+				} else {
+					JobsList.DecErrCount(1)
+				}
+
+				if JobsList.Empty() && Job.Depth+1 > MaxDepth {
+					Shutdown(CrawlIn)
+					return
+				}
+				JobsList.ErrorQueue.Push(Job)
+				for i := 0; i < CrawlersCount-len(CrawlIn); i++ {
+					JobsList.RunJob()
+				}
+				//JobsList.RunJob()
+				continue
+			}
+			fmt.Println("Crawled", Job.Id, Job.CrawlItem.Url, len(Job.CrawlItem.Body), Job.CrawlItem.Error)
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						if fmt.Sprintf("%s", r) != "send on closed channel" {
+							panic(r)
+						}
+					}
+				}()
+				ParseIn <- Workers.NewParseJob(Job.Id, Job.Depth, Parse.NewItem(Job.CrawlItem.Body))
+			}()
+		case Job := <-ParseOut:
+			if Job == nil {
+				continue
+			}
+			JobsList.DoneJob()
+			Count++
+			fmt.Println("Parsed", Job.Id, len(Job.ParseItem.BLList), Job.ParseItem.Error)
+
+			if JobsList.Empty() && Job.Depth+1 > MaxDepth {
+				Shutdown(CrawlIn)
 				return
+			}
+			if Job.ParseItem.Error != nil {
+				JobsList.ErrorQueue.Push(Job)
+				for i := 0; i < CrawlersCount-len(CrawlIn); i++ {
+					JobsList.RunJob()
+				}
+				//JobsList.RunJob()
+				continue
 			}
 			if Job.Depth+1 <= MaxDepth {
 				for i := 0; i < len(Job.ParseItem.BLList); i++ {
@@ -73,76 +136,39 @@ func Dispatcher(CrawlIn, CrawlOut chan *Workers.CrawlJob, ParseIn, ParseOut chan
 					JobsList.Queue.Push(Job)
 				}
 			}
-
-			JobsList.RunJob()
-
+			for i := 0; i < CrawlersCount-len(CrawlIn); i++ {
+				JobsList.RunJob()
+			}
+			//JobsList.RunJob()
 		}
 	}
 }
 
-func ShutdownWorkers(CrawlIn, CrawlOut chan *Workers.CrawlJob, ParseIn, ParseOut chan *Workers.ParseJob) {
+func Shutdown(CrawlIn chan *Workers.CrawlJob) {
 	close(CrawlIn)
-	close(CrawlOut)
-	close(ParseIn)
-	close(ParseOut)
-	fmt.Println("Done...", Count)
 }
 
-type JobsPool struct {
-	out       chan *Workers.CrawlJob
-	Queue     *Queue.Q
-	mu        *sync.RWMutex
-	JobsCount int
-}
+func interceptInterrupt(CrawlIn chan *Workers.CrawlJob) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
 
-func (j *JobsPool) IncCount() {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-
-	j.JobsCount++
-}
-func (j *JobsPool) DecCount() {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-
-	j.JobsCount--
-}
-func (j JobsPool) Count() int {
-	j.mu.RLock()
-	defer j.mu.RUnlock()
-
-	return j.JobsCount
-}
-func (j *JobsPool) RunJob() {
-	item := j.Queue.Pop()
-	if item == nil {
-		return
-	}
-	Job := item.(*Workers.CrawlJob)
-	go func() {
-		j.out <- Job
-	}()
-	j.IncCount()
-}
-func NewJobs(out chan *Workers.CrawlJob, queue *Queue.Q) *JobsPool {
-	return &JobsPool{
-		out:   out,
-		Queue: queue,
-		mu:    &sync.RWMutex{},
-	}
+	<-c
+	fmt.Println()
+	fmt.Println("Force Shutdown...", len(CrawlIn))
+	Shutdown(CrawlIn)
 }
 
 func main() {
 	s := time.Now()
 
-	CrawlIn := make(chan *Workers.CrawlJob)
-	CrawlOut := make(chan *Workers.CrawlJob)
-	ParseIn := make(chan *Workers.ParseJob)
-	ParseOut := make(chan *Workers.ParseJob)
-	//StartList := []string{"http://yandex.ru", "http://ya.ru", "http://golang.org"}
+	CrawlIn := make(chan *Workers.CrawlJob, CrawlersCount)
+	CrawlOut := make(chan *Workers.CrawlJob, CrawlersCount)
+	ParseIn := make(chan *Workers.ParseJob, ParsersCount)
+	ParseOut := make(chan *Workers.ParseJob, ParsersCount)
+	//StartList := []string{"http://ya.ru", "http://go-search.org"}
+	//StartList := []string{"ya.ru", "http://ya.ru"}
 	StartList := []string{"http://ya.ru"}
-	queue := Queue.NewQ()
-	JobsList := NewJobs(CrawlIn, queue)
+	JobsList := NewJobsPool(CrawlIn)
 
 	cwg := &sync.WaitGroup{}
 	pwg := &sync.WaitGroup{}
@@ -150,35 +176,24 @@ func main() {
 	RunCrawlers(CrawlIn, CrawlOut, cwg)
 	RunParsers(ParseIn, ParseOut, pwg)
 	go Dispatcher(CrawlIn, CrawlOut, ParseIn, ParseOut, JobsList)
+	go ErrorsDispatcher(CrawlIn, JobsList)
+	go interceptInterrupt(CrawlIn)
 
 	for i := 0; i < len(StartList); i++ {
 		Job := Workers.NewCrawlJob(NewJobId(), 0, Crawl.NewItem(StartList[i]))
-		queue.Push(Job)
+		JobsList.Queue.Push(Job)
 	}
 	for i := 0; i < CrawlersCount; i++ {
 		JobsList.RunJob()
 	}
 
 	cwg.Wait()
-	//close(CrawlIn)
+	close(CrawlOut)
 
+	close(ParseIn)
 	pwg.Wait()
-	//close(ParseIn)
-	//w := new(Worker)
+	close(ParseOut)
 
-	//crwlrJob := Crawler.NewItem("http://ya.ru")
-	//err := crwlrJob.Crawl()
-	//if err != nil {
-	//	fmt.Println(err)
-	//}
-	//fmt.Println("crawled", time.Now().Sub(s))
-	//
-	//s1 := time.Now()
-	//prsrJob := Parser.NewItem(crwlrJob.Body)
-	//prsrJob.Parse()
-	//fmt.Println("parsed", time.Now().Sub(s1))
-	//
-	//fmt.Println(len(prsrJob.BLList))
-
+	fmt.Println("Done...", Count)
 	fmt.Println(time.Now().Sub(s))
 }

@@ -7,7 +7,6 @@ import (
 )
 
 type Item struct {
-	//Id     int
 	Body   []byte
 	BLList []string
 	Error  error
@@ -25,13 +24,12 @@ func (p *Item) parse(n *html.Node) {
 		p.parse(c)
 	}
 }
-func (p *Item) Parse() error {
+func (p *Item) Parse() {
 	doc, err := html.Parse(bytes.NewReader(p.Body))
 	if err != nil {
-		return err
+		p.Error = err
 	}
 	p.parse(doc)
-	return nil
 }
 
 func NewItem(body []byte) *Item {

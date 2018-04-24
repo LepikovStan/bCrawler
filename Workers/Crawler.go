@@ -8,6 +8,10 @@ import (
 	"github.com/LepikovStan/bCrawler/Crawl"
 )
 
+const (
+	Retry = 2
+)
+
 type Crawler struct {
 	Id      int
 	In, Out chan *CrawlJob
@@ -15,8 +19,8 @@ type Crawler struct {
 }
 
 type CrawlJob struct {
-	Id, Depth int
-	CrawlItem *Crawl.Item
+	Id, Depth, Retry int
+	CrawlItem        *Crawl.Item
 }
 
 func (c Crawler) Run() {
@@ -25,10 +29,7 @@ func (c Crawler) Run() {
 		Job.CrawlItem.Crawl()
 		c.Out <- Job
 	}
-	c.Wg.Done()
-}
-
-func (c Crawler) Shutdown() {
+	fmt.Println("Shutdown Crawler", c.Id)
 	c.Wg.Done()
 }
 
@@ -37,6 +38,7 @@ func NewCrawlJob(Id, Depth int, CrawlItem *Crawl.Item) *CrawlJob {
 		Id:        Id,
 		Depth:     Depth,
 		CrawlItem: CrawlItem,
+		Retry:     Retry,
 	}
 }
 

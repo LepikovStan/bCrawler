@@ -6,25 +6,25 @@ import (
 )
 
 type Item struct {
-	//Id    int
 	Url   string
 	Body  []byte
 	Error error
 }
 
-func (c *Item) Crawl() error {
+func (c *Item) Crawl() {
 	resp, err := http.Get(c.Url)
 	if err != nil {
-		return err
+		c.Error = err
+		return
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		c.Error = err
+		return
 	}
 	c.Body = body
-	return nil
 }
 
 func NewItem(url string) *Item {
